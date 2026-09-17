@@ -41,6 +41,10 @@ logger = setup_logger()
 _NUM_RETRIES = 5
 _TIMEOUT = 60
 _LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
+# Linear applies its own (smaller) default limit on nested connections like
+# comments. Request an explicit page size so the cap is intentional, and log
+# when an issue exceeds it instead of silently dropping comments.
+_MAX_COMMENTS_PER_ISSUE = 100
 _ACCESS_TOKEN = "access_token"
 _EXPIRE_AT = "expire_at"
 _REFRESH_TOKEN = "refresh_token"
@@ -227,7 +231,7 @@ class LinearConnector(LoadConnector, PollConnector, OAuthConnector):
 
         query = (
             """
-            query IterateIssueBatches($first: Int, $after: String) {
+            query IterateIssueBatches($first: Int, $after: String, $commentFirst: Int) {
                 issues(
                     orderBy: updatedAt,
                     first: $first,
@@ -287,10 +291,13 @@ class LinearConnector(LoadConnector, PollConnector, OAuthConnector):
                             }
                             customerTicketCount
                             description
-                            comments {
+                            comments(first: $commentFirst) {
                                 nodes {
                                     url
                                     body
+                                }
+                                pageInfo {
+                                    hasNextPage
                                 }
                             }
                         }
@@ -312,6 +319,7 @@ class LinearConnector(LoadConnector, PollConnector, OAuthConnector):
                 "variables": {
                     "first": self.batch_size,
                     "after": endCursor,
+                    "commentFirst": _MAX_COMMENTS_PER_ISSUE,
                 },
             }
             logger.debug("Requesting issues from Linear with query: %s", graphql_query)
@@ -324,6 +332,19 @@ class LinearConnector(LoadConnector, PollConnector, OAuthConnector):
             documents: list[Document | HierarchyNode] = []
             for edge in edges:
                 node = edge["node"]
+
+                # Comments are a nested connection, so they are capped per issue.
+                # Surface the truncation rather than losing the tail silently.
+                comments = node.get("comments") or {}
+                if (comments.get("pageInfo") or {}).get("hasNextPage"):
+                    logger.warning(
+                        "Issue %s has more than %d comments; only the first %d were "
+                        "indexed and the rest were truncated.",
+                        node.get("identifier") or node["id"],
+                        _MAX_COMMENTS_PER_ISSUE,
+                        _MAX_COMMENTS_PER_ISSUE,
+                    )
+
                 # Create sections for description and comments
                 sections = [
                     TextSection(
@@ -338,7 +359,7 @@ class LinearConnector(LoadConnector, PollConnector, OAuthConnector):
                         link=node["url"],
                         text=comment["body"] or "",
                     )
-                    for comment in node["comments"]["nodes"]
+                    for comment in comments.get("nodes") or []
                 )
 
                 # Cast the sections list to the expected type
